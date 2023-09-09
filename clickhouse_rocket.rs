@@ -62,10 +62,13 @@ async fn get_btc_price() -> Result<Json<BtcPrice>, Status> {
 }
 
 #[get("/btc_trades")]
-async fn get_btc_trades() -> Result<Json<BtcTrades>, Status> {
+async fn get_btc_trades() -> Result<Json<BtcTrades>, String> {
     match binance_btc_trades().await {
         Ok(trades) => Ok(Json(trades)),
-        Err(_) => Err(Status::InternalServerError),
+        Err(e) => {
+            eprintln!("Error fetching BTC trades: {:?}", e);
+            Err(format!("Error fetching BTC trades: {:?}", e))
+        },
     }
 }
 
@@ -105,7 +108,6 @@ async fn binance_order_book_data() -> Result<(Bids, Asks), Error> {
 async fn binance_btc_price() -> Result<BtcPrice, Error> {
     let symbol = "BTCUSDT";
     let ticker_url = format!("https://api.binance.com/api/v3/ticker/price?symbol={}", symbol);
-
     let ticker_response: TickerPrice = reqwest::get(&ticker_url).await?.json().await?;
     let current_time = Utc::now().naive_utc();
 
@@ -123,7 +125,10 @@ async fn binance_btc_trades() -> Result<BtcTrades, Error> {
     let recent_trades_response: Vec<RecentTrade> = reqwest::get(&recent_trades_url).await?.json().await?;
     let current_time = Utc::now().naive_utc().to_string();
 
-    insert_trades_into_clickhouse(&recent_trades_response).await?;
+    for trade in &recent_trades_response {
+        let timestamp = Utc::now().naive_utc();
+        insert_trade_into_clickhouse(&timestamp, &(trade.id as u64), &trade.price, &trade.qty).await?;
+    }
 
     Ok(BtcTrades {
         trades: recent_trades_response,
@@ -131,7 +136,45 @@ async fn binance_btc_trades() -> Result<BtcTrades, Error> {
     })
 }
 
-async fn periodic_insert_into_clickhouse() {
+async fn insert_trade_into_clickhouse(timestamp: &NaiveDateTime, id: &u64, price: &str, amount: &str) -> Result<(), reqwest::Error> {
+    let client = reqwest::Client::new();  // Changed to asynchronous client
+    let query = format!(
+        "INSERT INTO btc_trades (timestamp, id, price, amount) VALUES ('{}', '{}', '{}', '{}')",
+        timestamp.format("%Y-%m-%d %H:%M:%S"), 
+        id,
+        price,
+        amount
+    );
+
+    let response = client.post(CLICKHOUSE_ENDPOINT)
+        .body(query)
+        .send()
+        .await?;
+
+    if response.status().is_success() {
+    } else {
+        eprintln!("Error inserting trade data: {}", response.status());
+    }
+
+    Ok(())
+}
+
+async fn periodic_insert_trades_into_clickhouse() {
+    loop {
+        let current_time = Utc::now().naive_utc();
+        match binance_btc_trades().await {
+            Ok(trades_data) => {
+            }
+            Err(e) => {
+                eprintln!("Error fetching trades: {}", e);
+            }
+        }
+
+        time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+async fn periodic_insert_price_clickhouse() {
     loop {
         let current_time = Utc::now().naive_utc();
         match binance_btc_price().await {
@@ -141,7 +184,7 @@ async fn periodic_insert_into_clickhouse() {
                 }
             }
             Err(e) => {
-                eprintln!("Error fetching price: {}", e);
+                eprintln!("Error fetching price: 2{}", e);
             }
         }
 
@@ -171,10 +214,15 @@ async fn insert_price_into_clickhouse(timestamp: &NaiveDateTime, price: &str) ->
 }
 
 #[rocket::main]
-async fn main() {
-    tokio::spawn(periodic_insert_into_clickhouse());
-    rocket::build()
+async fn main() -> Result<(), rocket::Error> {
+    tokio::spawn(periodic_insert_price_clickhouse());
+    tokio::spawn(periodic_insert_trades_into_clickhouse());
+    match rocket::build()
         .mount("/", routes![get_btc_price, get_btc_trades, get_btc_asks, get_btc_bids])
         .launch()
-        .await;
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(e) => Err(e),
+    }
 }
